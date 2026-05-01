@@ -20,41 +20,96 @@ const analyzeUserQuestion = (message = "") => {
     focusMetric: null,
   };
 
-  if (hasAny(text, ["which", "list", "show", "how many", "count", "bots"])) {
+  const isCountQuestion = hasAny(text, [
+    "how many",
+    "count",
+    "number of",
+    "total",
+  ]);
+
+  const isChartQuestion = hasAny(text, [
+    "chart",
+    "graph",
+    "visual",
+    "visualize",
+    "comparison",
+    "compare",
+    "trend",
+    "distribution",
+    "breakdown",
+  ]);
+
+  const isTableQuestion = hasAny(text, [
+    "list",
+    "table",
+    "show me bots",
+    "show bots",
+    "which bots",
+    "show all",
+    "details",
+  ]);
+
+  const isRecommendationQuestion = hasAny(text, [
+    "fix",
+    "action",
+    "recommend",
+    "improve",
+    "issue",
+    "what should",
+  ]);
+
+  if (isCountQuestion) {
+    plan.intent = "count";
+    plan.requestedView.push("summary_card");
+  }
+
+  if (isTableQuestion) {
     plan.intent = "list_bots";
     plan.requestedView.push("table");
   }
 
-  if (hasAny(text, ["compare", "comparison", "chart", "graph", "trend"])) {
+  if (isChartQuestion) {
+    plan.intent = "chart";
     plan.requestedView.push("chart");
   }
 
   if (hasAny(text, ["summary", "today", "overview"])) {
     plan.intent = "summary";
+    plan.requestedView.push("summary_card");
     plan.requestedView.push("chart");
   }
 
   if (hasAny(text, ["critical", "critical stage", "red"])) {
     plan.filter.healthStatus = "critical";
-    plan.intent = "list_bots";
     plan.focusMetric = "healthStatus";
-    plan.requestedView.push("table");
+    plan.sortBy = "healthScore";
+    plan.sortOrder = "asc";
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
   }
 
   if (hasAny(text, ["warning", "attention", "risk", "yellow"])) {
     plan.filter.healthStatus = "warning";
-    plan.intent = "list_bots";
     plan.focusMetric = "healthStatus";
-    plan.requestedView.push("table");
+    plan.sortBy = "healthScore";
+    plan.sortOrder = "asc";
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
   }
 
   if (hasAny(text, ["healthy", "stable", "good", "green"])) {
     plan.filter.healthStatus = "healthy";
-    plan.intent = "list_bots";
     plan.focusMetric = "healthStatus";
     plan.sortBy = "healthScore";
     plan.sortOrder = "desc";
-    plan.requestedView.push("table");
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
   }
 
   if (hasAny(text, ["fallback", "fallback rate", "unanswered"])) {
@@ -64,12 +119,17 @@ const analyzeUserQuestion = (message = "") => {
       value: 30,
     });
 
-    plan.intent = "list_bots";
     plan.focusMetric = "fallbackRate";
     plan.sortBy = "fallbackRate";
     plan.sortOrder = "desc";
-    plan.requestedView.push("table");
-    plan.requestedView.push("chart");
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
+
+    if (isChartQuestion || hasAny(text, ["compare", "trend"])) {
+      plan.requestedView.push("chart");
+    }
   }
 
   if (hasAny(text, ["failure", "failed", "error", "errors"])) {
@@ -79,12 +139,17 @@ const analyzeUserQuestion = (message = "") => {
       value: 25,
     });
 
-    plan.intent = "list_bots";
     plan.focusMetric = "failureRate";
     plan.sortBy = "failureRate";
     plan.sortOrder = "desc";
-    plan.requestedView.push("table");
-    plan.requestedView.push("chart");
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
+
+    if (isChartQuestion || hasAny(text, ["compare", "trend"])) {
+      plan.requestedView.push("chart");
+    }
   }
 
   if (hasAny(text, ["drop", "dropoff", "drop-off", "drop off", "abandon"])) {
@@ -94,26 +159,40 @@ const analyzeUserQuestion = (message = "") => {
       value: 35,
     });
 
-    plan.intent = "list_bots";
     plan.focusMetric = "dropOffRate";
     plan.sortBy = "dropOffRate";
     plan.sortOrder = "desc";
-    plan.requestedView.push("table");
-    plan.requestedView.push("chart");
+
+    if (!isCountQuestion && !isChartQuestion) {
+      plan.requestedView.push("table");
+    }
+
+    if (isChartQuestion || hasAny(text, ["compare", "trend"])) {
+      plan.requestedView.push("chart");
+    }
   }
 
   if (hasAny(text, ["success", "success rate", "performing well"])) {
-    plan.intent = "list_bots";
     plan.focusMetric = "successRate";
     plan.sortBy = "successRate";
     plan.sortOrder = "desc";
-    plan.requestedView.push("table");
-    plan.requestedView.push("chart");
+
+    if (!isCountQuestion) {
+      plan.requestedView.push("table");
+    }
+
+    if (isChartQuestion || hasAny(text, ["compare", "trend"])) {
+      plan.requestedView.push("chart");
+    }
   }
 
-  if (hasAny(text, ["fix", "action", "recommend", "improve", "issue"])) {
+  if (isRecommendationQuestion) {
     plan.intent = "recommendation";
     plan.requestedView.push("list");
+
+    if (!isCountQuestion) {
+      plan.requestedView.push("table");
+    }
   }
 
   if (hasAny(text, ["top 5", "five"])) {
@@ -122,6 +201,10 @@ const analyzeUserQuestion = (message = "") => {
 
   if (hasAny(text, ["top 3", "three"])) {
     plan.limit = 3;
+  }
+
+  if (isChartQuestion && !plan.requestedView.includes("chart")) {
+    plan.requestedView.push("chart");
   }
 
   plan.requestedView = [...new Set(plan.requestedView)];

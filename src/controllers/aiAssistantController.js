@@ -458,6 +458,26 @@ const buildResponseBlocks = ({ answer, queryPlan, matchedBots }) => {
   const isSingleBot = bots.length === 1;
   const selectedBot = isSingleBot ? bots[0] : null;
 
+  if (queryPlan.requestedView.includes("summary_card") && !isSingleBot) {
+    blocks.push({
+      id: "result-summary-card",
+      type: "summary_card",
+      title: "Result Summary",
+      statusType: queryPlan.filter.healthStatus || "info",
+      data: {
+        matchedCount: bots.length,
+        focusMetric: queryPlan.focusMetric,
+        healthStatus: queryPlan.filter.healthStatus || null,
+        topBots: bots.slice(0, 3).map((bot) => ({
+          tenantName: bot.tenantName,
+          botName: bot.botName,
+          healthStatus: bot.healthStatus,
+          healthScore: bot.healthScore,
+        })),
+      },
+    });
+  }
+
   if (isSingleBot && selectedBot) {
     blocks.push({
       id: "bot-summary-card",
