@@ -7,6 +7,10 @@ const {
   generateGeminiText,
   streamGeminiText,
 } = require("../services/geminiService");
+const {
+  analyzeUserQuestion,
+  applyAssistantQueryPlan,
+} = require("../services/assistantQueryPlanner");
 
 const cleanValue = (value) => {
   if (value === undefined || value === null) return "";
@@ -33,20 +37,42 @@ const chatWithAssistant = async (req, res) => {
       botId,
     });
 
+    const queryPlan = analyzeUserQuestion(message);
+
+    const matchedBots = applyAssistantQueryPlan({
+      bots: contextData.bots,
+      plan: queryPlan,
+    });
+
+    const dbFallbackAnswer = buildDbFallbackAnswer({
+      contextData,
+      queryPlan,
+      matchedBots,
+    });
+
     const prompt = buildAssistantPrompt({
       message,
       contextData,
+      queryPlan,
+      matchedBots,
+      dbFallbackAnswer,
     });
 
-    const answer = await generateGeminiText(prompt);
+    const geminiResult = await generateGeminiText(prompt);
+
+    const answer = geminiResult.success ? geminiResult.text : dbFallbackAnswer;
 
     const blocks = buildResponseBlocks({
-      message,
       answer,
-      contextData,
+      queryPlan,
+      matchedBots,
     });
 
-    const suggestions = buildSuggestions(contextData);
+    const suggestions = buildSuggestions({
+      contextData,
+      queryPlan,
+      matchedBots,
+    });
 
     return successResponse(
       res,
@@ -60,6 +86,15 @@ const chatWithAssistant = async (req, res) => {
         blocks,
         suggestions,
         contextSummary: contextData.summary,
+        queryPlan,
+        matchedCount: matchedBots.length,
+        aiProvider: {
+          provider: geminiResult.provider,
+          usedGemini: geminiResult.success,
+          fallbackUsed: !geminiResult.success,
+          errorType: geminiResult.errorType || null,
+          message: geminiResult.errorMessage || null,
+        },
       },
     );
   } catch (error) {
@@ -87,20 +122,38 @@ const streamChatWithAssistant = async (req, res) => {
       botId,
     });
 
+    const queryPlan = analyzeUserQuestion(message);
+
+    const matchedBots = applyAssistantQueryPlan({
+      bots: contextData.bots,
+      plan: queryPlan,
+    });
+
     sendSseEvent(res, "meta", {
       scope: {
         tenantId: tenantId || null,
         botId: botId || null,
       },
       contextSummary: contextData.summary,
+      queryPlan,
+      matchedCount: matchedBots.length,
+    });
+
+    const dbFallbackAnswer = buildDbFallbackAnswer({
+      contextData,
+      queryPlan,
+      matchedBots,
     });
 
     const prompt = buildAssistantPrompt({
       message,
       contextData,
+      queryPlan,
+      matchedBots,
+      dbFallbackAnswer,
     });
 
-    const answer = await streamGeminiText({
+    const geminiResult = await streamGeminiText({
       prompt,
       onText: (text) => {
         sendSseEvent(res, "text_delta", {
@@ -109,19 +162,52 @@ const streamChatWithAssistant = async (req, res) => {
       },
     });
 
+    const answer = geminiResult.success ? geminiResult.text : dbFallbackAnswer;
+
+    if (!geminiResult.success) {
+      sendSseEvent(res, "text_delta", {
+        text: answer,
+      });
+    }
+
     const blocks = buildResponseBlocks({
-      message,
       answer,
-      contextData,
+      queryPlan,
+      matchedBots,
     });
 
-    const suggestions = buildSuggestions(contextData);
+    const suggestions = buildSuggestions({
+      contextData,
+      queryPlan,
+      matchedBots,
+    });
+
+    for (const block of blocks) {
+      if (block.type === "text") {
+        continue;
+      }
+
+      sendSseEvent(res, "block", block);
+    }
+
+    sendSseEvent(res, "suggestions", {
+      suggestions,
+    });
 
     sendSseEvent(res, "final", {
       answer,
       blocks,
       suggestions,
       contextSummary: contextData.summary,
+      queryPlan,
+      matchedCount: matchedBots.length,
+      aiProvider: {
+        provider: geminiResult.provider,
+        usedGemini: geminiResult.success,
+        fallbackUsed: !geminiResult.success,
+        errorType: geminiResult.errorType || null,
+        message: geminiResult.errorMessage || null,
+      },
     });
 
     sendSseEvent(res, "done", {
@@ -152,7 +238,7 @@ const buildAssistantContext = async ({ tenantId, botId }) => {
   const bots = await Bot.find(botFilter)
     .populate("tenantId", "name code industry status")
     .sort({ createdAt: -1 })
-    .limit(50);
+    .limit(100);
 
   const botIds = bots.map((bot) => bot._id);
 
@@ -188,6 +274,7 @@ const buildAssistantContext = async ({ tenantId, botId }) => {
       useCase: bot.useCase,
       status: bot.status,
       mockProfile: bot.mockProfile,
+
       conversations: metric?.totalConversations || 0,
       activeUsers: metric?.activeUsers || 0,
       successRate: metric?.successRate || 0,
@@ -197,10 +284,12 @@ const buildAssistantContext = async ({ tenantId, botId }) => {
       avgResponseTime: metric?.avgResponseTime || 0,
       healthScore: metric?.healthScore || 0,
       healthStatus: metric?.healthStatus || "healthy",
+
       issueCount: botIssues.length,
       aiReason: mainIssue?.description || "No major issue detected.",
       recommendedAction:
         mainIssue?.recommendedAction || "Continue monitoring bot performance.",
+
       issues: botIssues.map((issue) => ({
         type: issue.type,
         severity: issue.severity,
@@ -265,38 +354,49 @@ const buildAssistantContext = async ({ tenantId, botId }) => {
 const getAverage = (items, key) => {
   if (!items.length) return 0;
 
-  const total = items.reduce((sum, item) => sum + Number(item[key] || 0), 0);
+  const total = items.reduce((sum, item) => {
+    return sum + Number(item[key] || 0);
+  }, 0);
 
   return Math.round(total / items.length);
 };
 
-const buildAssistantPrompt = ({ message, contextData }) => {
+const buildAssistantPrompt = ({
+  message,
+  contextData,
+  queryPlan,
+  matchedBots,
+  dbFallbackAnswer,
+}) => {
   return `
 You are an AI Ops Assistant for a Bot Usage Monitoring Dashboard.
 
 Your user is a platform admin.
 
-Your responsibilities:
-- Explain bot health.
-- Identify critical bots.
-- Identify tenants needing attention.
-- Explain why a bot is critical.
-- Recommend what to fix first.
-- Use only the provided data.
+Important:
+- Use only the provided matched bot data.
+- Do not use bot data outside matchedBotData.
 - Do not invent numbers.
-- Keep the response short and practical.
-- Do not return markdown tables.
+- Keep the answer short and practical.
 - Do not return JSON.
-- Return a natural language admin-friendly answer.
+- Do not return markdown table.
+- The backend will generate table/chart separately.
+- Your text answer must match the matched bot data.
+- If matchedBotData is empty, say no matching bots were found.
+- Prefer this fallback answer if it already answers the user correctly:
+${dbFallbackAnswer}
 
 Admin question:
 ${message}
 
+Query plan:
+${JSON.stringify(queryPlan, null, 2)}
+
 Dashboard summary:
 ${JSON.stringify(contextData.summary, null, 2)}
 
-Bot performance data:
-${JSON.stringify(contextData.bots, null, 2)}
+Matched bot data:
+${JSON.stringify(matchedBots, null, 2)}
 
 Answer style:
 - Direct answer first.
@@ -305,9 +405,41 @@ Answer style:
 `;
 };
 
-const buildResponseBlocks = ({ message, answer, contextData }) => {
-  const lowerMessage = message.toLowerCase();
+const buildDbFallbackAnswer = ({ contextData, queryPlan, matchedBots }) => {
+  const summary = contextData.summary || {};
+  const bots = matchedBots || [];
 
+  if (!contextData.bots.length) {
+    return "No bot data is available for the selected filters.";
+  }
+
+  if (!bots.length) {
+    return "No bots matched your question in the selected scope.";
+  }
+
+  if (bots.length === 1) {
+    const bot = bots[0];
+
+    return `${bot.tenantName} / ${bot.botName} is ${bot.healthStatus} with a health score of ${bot.healthScore}. It handled ${bot.conversations} conversations with ${bot.successRate}% success rate, ${bot.fallbackRate}% fallback rate, ${bot.failureRate}% failure rate, and ${bot.dropOffRate}% drop-off rate. Recommended action: ${bot.recommendedAction}`;
+  }
+
+  const names = bots
+    .slice(0, 5)
+    .map((bot) => `${bot.tenantName} / ${bot.botName}`)
+    .join(", ");
+
+  if (queryPlan.filter.healthStatus) {
+    return `${bots.length} bot(s) are ${queryPlan.filter.healthStatus}: ${names}. Across the selected scope, total conversations are ${summary.totalConversations || 0}, average success rate is ${summary.avgSuccessRate || 0}%, and average fallback rate is ${summary.avgFallbackRate || 0}%.`;
+  }
+
+  if (queryPlan.focusMetric) {
+    return `${bots.length} bot(s) matched the ${queryPlan.focusMetric} condition: ${names}. Review the table for details and prioritize the highest-risk bots first.`;
+  }
+
+  return `${bots.length} bot(s) matched your question: ${names}. Across the selected scope, total conversations are ${summary.totalConversations || 0}, average success rate is ${summary.avgSuccessRate || 0}%, and average fallback rate is ${summary.avgFallbackRate || 0}%.`;
+};
+
+const buildResponseBlocks = ({ answer, queryPlan, matchedBots }) => {
   const blocks = [
     {
       id: "answer-text",
@@ -317,12 +449,14 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
     },
   ];
 
-  const sortedBots = [...contextData.bots].sort(
-    (a, b) => a.healthScore - b.healthScore,
-  );
+  const bots = matchedBots || [];
 
-  const isSingleBot = sortedBots.length === 1;
-  const selectedBot = isSingleBot ? sortedBots[0] : null;
+  if (!bots.length) {
+    return blocks;
+  }
+
+  const isSingleBot = bots.length === 1;
+  const selectedBot = isSingleBot ? bots[0] : null;
 
   if (isSingleBot && selectedBot) {
     blocks.push({
@@ -337,10 +471,12 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
         healthStatus: selectedBot.healthStatus,
         healthScore: selectedBot.healthScore,
         conversations: selectedBot.conversations,
+        activeUsers: selectedBot.activeUsers,
         successRate: selectedBot.successRate,
         fallbackRate: selectedBot.fallbackRate,
         failureRate: selectedBot.failureRate,
         dropOffRate: selectedBot.dropOffRate,
+        avgResponseTime: selectedBot.avgResponseTime,
         recommendedAction: selectedBot.recommendedAction,
       },
     });
@@ -391,24 +527,7 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
     return blocks;
   }
 
-  const needTable =
-    lowerMessage.includes("which") ||
-    lowerMessage.includes("list") ||
-    lowerMessage.includes("table") ||
-    lowerMessage.includes("critical") ||
-    lowerMessage.includes("attention") ||
-    lowerMessage.includes("compare") ||
-    sortedBots.length > 1;
-
-  const needChart =
-    lowerMessage.includes("chart") ||
-    lowerMessage.includes("graph") ||
-    lowerMessage.includes("trend") ||
-    lowerMessage.includes("compare") ||
-    lowerMessage.includes("summary") ||
-    lowerMessage.includes("today");
-
-  if (needTable) {
+  if (queryPlan.requestedView.includes("table")) {
     blocks.push({
       id: "bot-performance-table",
       type: "table",
@@ -451,7 +570,7 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
           label: "Drop-off %",
         },
       ],
-      rows: sortedBots.slice(0, 10).map((bot) => ({
+      rows: bots.map((bot) => ({
         tenantName: bot.tenantName,
         botName: bot.botName,
         useCase: bot.useCase,
@@ -465,17 +584,18 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
     });
   }
 
-  if (needChart) {
+  if (queryPlan.requestedView.includes("chart")) {
     blocks.push({
-      id: "bot-health-chart",
+      id: "bot-chart",
       type: "chart",
-      title: "Bot Health Score Comparison",
+      title: getChartTitle(queryPlan),
       chartType: "bar",
       xKey: "botName",
-      yKeys: ["healthScore"],
-      data: sortedBots.slice(0, 8).map((bot) => ({
+      yKeys: getChartYKeys(queryPlan),
+      data: bots.map((bot) => ({
         botName: bot.botName,
         healthScore: bot.healthScore,
+        successRate: bot.successRate,
         fallbackRate: bot.fallbackRate,
         failureRate: bot.failureRate,
         dropOffRate: bot.dropOffRate,
@@ -483,18 +603,12 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
     });
   }
 
-  if (
-    lowerMessage.includes("fallback") ||
-    lowerMessage.includes("failure") ||
-    lowerMessage.includes("drop") ||
-    lowerMessage.includes("issue") ||
-    lowerMessage.includes("fix")
-  ) {
+  if (queryPlan.requestedView.includes("list")) {
     blocks.push({
       id: "issue-action-list",
       type: "list",
       title: "Recommended Fixes",
-      items: sortedBots.slice(0, 5).map((bot) => ({
+      items: bots.map((bot) => ({
         title: `${bot.tenantName} / ${bot.botName}`,
         description: bot.aiReason,
         action: bot.recommendedAction,
@@ -506,10 +620,50 @@ const buildResponseBlocks = ({ message, answer, contextData }) => {
   return blocks;
 };
 
-const buildSuggestions = (contextData) => {
-  const summary = contextData.summary;
-  const isSingleBot = contextData.bots.length === 1;
-  const selectedBot = isSingleBot ? contextData.bots[0] : null;
+const getChartTitle = (queryPlan) => {
+  if (queryPlan.focusMetric === "fallbackRate") {
+    return "Fallback Rate Comparison";
+  }
+
+  if (queryPlan.focusMetric === "failureRate") {
+    return "Failure Rate Comparison";
+  }
+
+  if (queryPlan.focusMetric === "dropOffRate") {
+    return "Drop-off Rate Comparison";
+  }
+
+  if (queryPlan.focusMetric === "successRate") {
+    return "Success Rate Comparison";
+  }
+
+  return "Bot Health Score Comparison";
+};
+
+const getChartYKeys = (queryPlan) => {
+  if (queryPlan.focusMetric === "fallbackRate") {
+    return ["fallbackRate"];
+  }
+
+  if (queryPlan.focusMetric === "failureRate") {
+    return ["failureRate"];
+  }
+
+  if (queryPlan.focusMetric === "dropOffRate") {
+    return ["dropOffRate"];
+  }
+
+  if (queryPlan.focusMetric === "successRate") {
+    return ["successRate"];
+  }
+
+  return ["healthScore"];
+};
+
+const buildSuggestions = ({ contextData, matchedBots }) => {
+  const summary = contextData.summary || {};
+  const isSingleBot = matchedBots.length === 1;
+  const selectedBot = isSingleBot ? matchedBots[0] : null;
 
   let suggestions = [];
 
@@ -532,32 +686,22 @@ const buildSuggestions = (contextData) => {
       suggestions.push("Compare this bot with others");
     }
 
-    return suggestions.slice(0, 8);
+    return [...new Set(suggestions)].slice(0, 8);
   }
 
   suggestions = [
     "Which bots are critical?",
+    "Which bots are healthy?",
     "Which tenant needs attention?",
+    "Which bots have high fallback?",
+    "Which bots have high failure?",
+    "Which bots have high drop-off?",
     "What should I fix first?",
-    "Show failed topics",
     "Compare bot performance",
-    "Show dashboard summary",
   ];
 
   if (summary.criticalBotsCount > 0) {
     suggestions.unshift("Show only critical bots");
-  }
-
-  if (summary.highFallbackBotsCount > 0) {
-    suggestions.unshift("Which bots have high fallback?");
-  }
-
-  if (summary.highFailureBotsCount > 0) {
-    suggestions.unshift("Which bots have high failure?");
-  }
-
-  if (summary.highDropOffBotsCount > 0) {
-    suggestions.unshift("Which bots have high drop-off?");
   }
 
   if (summary.criticalBotsCount === 0 && summary.warningBotsCount === 0) {
@@ -567,6 +711,7 @@ const buildSuggestions = (contextData) => {
 
   return [...new Set(suggestions)].slice(0, 8);
 };
+
 module.exports = {
   chatWithAssistant,
   streamChatWithAssistant,

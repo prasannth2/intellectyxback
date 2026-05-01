@@ -82,6 +82,7 @@ const getBots = async (req, res) => {
       status,
       useCase,
       search,
+      healthStatus,
       page = 1,
       limit = 10,
     } = req.query;
@@ -112,42 +113,30 @@ const getBots = async (req, res) => {
     const perPage = Math.max(Number(limit) || 10, 1);
     const skip = (currentPage - 1) * perPage;
 
-    const total = await Bot.countDocuments(filter);
-
-    const bots = await Bot.find(filter)
+    const allMatchingBots = await Bot.find(filter)
       .populate("tenantId", "name code industry status")
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(perPage);
+      .sort({ createdAt: -1 });
 
-    const botIds = bots.map((bot) => bot._id);
+    const allBotIds = allMatchingBots.map((bot) => bot._id);
 
-    const metrics = await BotMetric.find({
-      botId: { $in: botIds },
+    const allMetrics = await BotMetric.find({
+      botId: { $in: allBotIds },
     });
 
-    const issues = await BotIssue.find({
-      botId: { $in: botIds },
-      status: { $ne: "resolved" },
-    });
-
-    const formattedBots = bots.map((bot) => {
-      const metric = metrics.find(
+    let formattedBots = allMatchingBots.map((bot) => {
+      const metric = allMetrics.find(
         (item) => item.botId.toString() === bot._id.toString(),
       );
-
-      const botIssues = issues.filter(
-        (item) => item.botId.toString() === bot._id.toString(),
-      );
-
-      const mainIssue = botIssues[0];
 
       return {
         _id: bot._id,
         status: bot.status,
-        tenantId: bot.tenantId?._id,
+
+        tenantId: bot.tenantId?._id || null,
         tenantName: bot.tenantId?.name || "",
         tenantCode: bot.tenantId?.code || "",
+        tenantIndustry: bot.tenantId?.industry || "",
+
         botName: bot.name,
         useCase: bot.useCase,
         description: bot.description,
@@ -165,19 +154,27 @@ const getBots = async (req, res) => {
         healthScore: metric?.healthScore || 0,
         healthStatus: metric?.healthStatus || "healthy",
 
-        aiReason: mainIssue?.description || "No major issue detected.",
-        recommendedAction:
-          mainIssue?.recommendedAction ||
-          "Continue monitoring bot performance.",
-        issueCount: botIssues.length,
+        hasIssues:
+          (metric?.healthStatus || "healthy") === "critical" ||
+          (metric?.healthStatus || "healthy") === "warning",
 
         createdAt: bot.createdAt,
         updatedAt: bot.updatedAt,
       };
     });
 
+    if (healthStatus) {
+      formattedBots = formattedBots.filter(
+        (bot) => bot.healthStatus === healthStatus,
+      );
+    }
+
+    const total = formattedBots.length;
+
+    const paginatedBots = formattedBots.slice(skip, skip + perPage);
+
     return successResponse(res, "Bots fetched successfully", {
-      bots: formattedBots,
+      bots: paginatedBots,
       pagination: {
         page: currentPage,
         limit: perPage,

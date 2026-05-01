@@ -3,6 +3,9 @@ const BotMetric = require("../models/BotMetric");
 const BotIssue = require("../models/BotIssue");
 const Tenant = require("../models/Tenant");
 const { successResponse, errorResponse } = require("../utils/response");
+const {
+  generateAiInsightsForDashboard,
+} = require("../services/aiInsightService");
 
 const cleanQueryValue = (value) => {
   if (value === undefined || value === null) return "";
@@ -15,6 +18,8 @@ const getDashboard = async (req, res) => {
     const botId = cleanQueryValue(req.query.botId);
     const status = cleanQueryValue(req.query.status);
     const useCase = cleanQueryValue(req.query.useCase);
+    const includeAiInsights =
+      cleanQueryValue(req.query.includeAiInsights) !== "false";
 
     const botFilter = {};
 
@@ -80,6 +85,22 @@ const getDashboard = async (req, res) => {
           )
         : 0;
 
+    const avgFailureRate =
+      metrics.length > 0
+        ? Math.round(
+            metrics.reduce((sum, item) => sum + (item.failureRate || 0), 0) /
+              metrics.length,
+          )
+        : 0;
+
+    const avgDropOffRate =
+      metrics.length > 0
+        ? Math.round(
+            metrics.reduce((sum, item) => sum + (item.dropOffRate || 0), 0) /
+              metrics.length,
+          )
+        : 0;
+
     const criticalBots = metrics.filter(
       (item) => item.healthStatus === "critical",
     ).length;
@@ -102,12 +123,6 @@ const getDashboard = async (req, res) => {
       const metric = metrics.find(
         (item) => item.botId.toString() === bot._id.toString(),
       );
-
-      const botIssues = issues.filter(
-        (item) => item.botId.toString() === bot._id.toString(),
-      );
-
-      const mainIssue = botIssues[0];
 
       return {
         _id: bot._id,
@@ -135,18 +150,30 @@ const getDashboard = async (req, res) => {
         healthScore: metric?.healthScore || 0,
         healthStatus: metric?.healthStatus || "healthy",
 
-        aiReason: mainIssue?.description || "No major issue detected.",
-        recommendedAction:
-          mainIssue?.recommendedAction ||
-          "Continue monitoring bot performance.",
-        issueCount: botIssues.length,
+        hasIssues:
+          (metric?.healthStatus || "healthy") === "critical" ||
+          (metric?.healthStatus || "healthy") === "warning",
 
         createdAt: bot.createdAt,
         updatedAt: bot.updatedAt,
       };
     });
 
-    const aiInsights = generateDashboardInsights(botList);
+    const summary = {
+      totalTenants,
+      activeTenants: tenantIds.length,
+      totalBots,
+      totalConversations,
+      avgSuccessRate,
+      avgFallbackRate,
+      avgFailureRate,
+      avgDropOffRate,
+      criticalBots,
+      warningBots,
+      healthyBots,
+      openIssues,
+      highSeverityIssues,
+    };
 
     const healthDistribution = [
       {
@@ -165,6 +192,25 @@ const getDashboard = async (req, res) => {
 
     const fallbackTrend = buildMockFallbackTrend(avgFallbackRate);
 
+    let aiInsights = [];
+    let aiInsightsProvider = {
+      provider: "gemini",
+      usedGemini: false,
+      fallbackUsed: false,
+      errorType: null,
+      message: "AI insights disabled.",
+    };
+
+    if (includeAiInsights) {
+      const aiInsightResult = await generateAiInsightsForDashboard({
+        summary,
+        botList,
+      });
+
+      aiInsights = aiInsightResult.insights;
+      aiInsightsProvider = aiInsightResult.aiProvider;
+    }
+
     return successResponse(res, "Dashboard fetched successfully", {
       filters: {
         tenantId: tenantId || null,
@@ -172,20 +218,9 @@ const getDashboard = async (req, res) => {
         status: status || null,
         useCase: useCase || null,
       },
-      summary: {
-        totalTenants,
-        activeTenants: tenantIds.length,
-        totalBots,
-        totalConversations,
-        avgSuccessRate,
-        avgFallbackRate,
-        criticalBots,
-        warningBots,
-        healthyBots,
-        openIssues,
-        highSeverityIssues,
-      },
+      summary,
       aiInsights,
+      aiInsightsProvider,
       botList,
       healthDistribution,
       fallbackTrend,
@@ -193,61 +228,6 @@ const getDashboard = async (req, res) => {
   } catch (error) {
     return errorResponse(res, error.message, 500);
   }
-};
-
-const generateDashboardInsights = (botList) => {
-  const insights = [];
-
-  const criticalBots = botList.filter((bot) => bot.healthStatus === "critical");
-  const warningBots = botList.filter((bot) => bot.healthStatus === "warning");
-  const highFallbackBots = botList.filter((bot) => bot.fallbackRate >= 30);
-  const highFailureBots = botList.filter((bot) => bot.failureRate >= 25);
-  const highDropOffBots = botList.filter((bot) => bot.dropOffRate >= 35);
-  const lowUsageBots = botList.filter((bot) => bot.conversations < 200);
-
-  criticalBots.slice(0, 3).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} is critical with health score ${bot.healthScore}. ${bot.recommendedAction}`,
-    );
-  });
-
-  warningBots.slice(0, 2).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} needs attention. Current health score is ${bot.healthScore}.`,
-    );
-  });
-
-  highFallbackBots.slice(0, 3).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} has a fallback rate of ${bot.fallbackRate}%. Review unanswered questions and improve intent coverage.`,
-    );
-  });
-
-  highFailureBots.slice(0, 3).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} has a failure rate of ${bot.failureRate}%. Check backend integrations and failed conversation flows.`,
-    );
-  });
-
-  highDropOffBots.slice(0, 3).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} has ${bot.dropOffRate}% user drop-off. Simplify answers and reduce conversation steps.`,
-    );
-  });
-
-  lowUsageBots.slice(0, 2).forEach((bot) => {
-    insights.push(
-      `${bot.tenantName} / ${bot.botName} has low usage with only ${bot.conversations} conversations. Improve bot visibility for users.`,
-    );
-  });
-
-  if (insights.length === 0) {
-    insights.push(
-      "All monitored bots are currently stable. Continue monitoring fallback rate, failure rate, and drop-off rate.",
-    );
-  }
-
-  return insights.slice(0, 8);
 };
 
 const buildMockFallbackTrend = (avgFallbackRate) => {
